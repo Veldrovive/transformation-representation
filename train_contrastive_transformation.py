@@ -22,7 +22,13 @@ def get_dataloader(args):
         num_input_examples=args["num_input_examples"],
         separate_neg_examples=args["sep_neg_examples"]
     )
-    return DataLoader(d, batch_size=args["batch_size"], shuffle=True, num_workers=args["num_workers"])
+    return DataLoader(
+        d,
+        batch_size=args["batch_size"],
+        shuffle=True,
+        num_workers=args["num_workers"],
+        pin_memory=args["device"] != "cpu"
+    )
 
 def get_models(args):
     return ConvTransEmbedder(), Gamma()
