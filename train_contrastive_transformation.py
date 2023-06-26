@@ -34,8 +34,11 @@ def triplet_loss(anchor, positive, negative, margin=0.2):
     return losses.mean()
 
 def main(args):
+    device = args["device"]
     # Start a new run
     run = wandb.init(project='transformation-representation')
+    # Add the args to the run
+    wandb.config.update(args)
     # Get run id
     run_id = wandb.run.id
     artifact_path = Path("artifacts") / run_id
@@ -122,8 +125,6 @@ def main(args):
             run.log_artifact(checkpoint_path / "gamma_best.pt")
             run.log_artifact(checkpoint_path / "optimizer_best.pt")
 
-
-
         # TODO: Implement validation
     # After all the logging is done, don't forget to close your run
     run.finish()
@@ -141,7 +142,9 @@ if __name__ == "__main__":
     args.add_argument("--num_workers", type=int, default=4)
     args.add_argument("--num_epochs", type=int, default=10)
     args.add_argument("--lr", type=float, default=1e-3)
+    args.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     # Convert to dict
     args = vars(args.parse_args())
+    print(args)
     main(args)
