@@ -8,22 +8,23 @@ import torch.nn.functional as F
 import torch
 from tqdm import tqdm
 from pathlib import Path
+from argparse import ArgumentParser
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
-def get_dataloader():
+def get_dataloader(args):
     d = create_image_transformation_dataset(
         seed=0,
         transformation_types=transformation_classes,
-        num_classes_per_transformation=20,
-        anchor_dir="imagenet/imagenette2-320",
-        example_dir=None,
-        num_input_examples=3,
-        separate_neg_examples=False
+        num_classes_per_transformation=args["num_classes_per_transformation"],
+        anchor_dir=Path(args["anchor_dir"]),
+        example_dir=Path(args["example_dir"]) if args["example_dir"] is not None else None,
+        num_input_examples=args["num_input_examples"],
+        separate_neg_examples=args["sep_neg_examples"]
     )
-    return DataLoader(d, batch_size=32, shuffle=True, num_workers=4)
+    return DataLoader(d, batch_size=args["batch_size"], shuffle=True, num_workers=args["num_workers"])
 
-def get_models():
+def get_models(args):
     return ConvTransEmbedder(), Gamma()
 
 def triplet_loss(anchor, positive, negative, margin=0.2):
@@ -32,7 +33,7 @@ def triplet_loss(anchor, positive, negative, margin=0.2):
     losses = F.relu(positive_dist - negative_dist + margin)
     return losses.mean()
 
-def main():
+def main(args):
     # Start a new run
     run = wandb.init(project='transformation-representation')
     # Get run id
@@ -42,13 +43,13 @@ def main():
     checkpoint_path = artifact_path / "checkpoints"
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
-    embedder, gamma = get_models()
-    dataloader = get_dataloader()
+    embedder, gamma = get_models(args)
+    dataloader = get_dataloader(args)
 
     embedder = embedder.to(device)
     gamma = gamma.to(device)
 
-    optimizer = torch.optim.Adam(list(embedder.parameters()) + list(gamma.parameters()), lr=1e-3)
+    optimizer = torch.optim.Adam(list(embedder.parameters()) + list(gamma.parameters()), lr=args["lr"])
     loss_queue = []
     loss_queue_max_size = 20
 
@@ -56,7 +57,7 @@ def main():
     best_epoch_loss = float("inf")
 
     max_epoch_len = len(dataloader)
-    epoch_len = min(max_epoch_len, 1000)
+    epoch_len = min(max_epoch_len, args["epoch_len"])
     logging_warmup = 10
 
     for i in range(10):
@@ -128,4 +129,19 @@ def main():
     run.finish()
 
 if __name__ == "__main__":
-    main()
+    args = ArgumentParser()
+    args.add_argument("--anchor_dir", type=str, required=True)
+    args.add_argument("--example_dir", type=str, default=None)
+    args.add_argument("--num_input_examples", type=int, default=3)
+    args.add_argument("--num_classes_per_transformation", type=int, default=20)
+    args.add_argument("--sep_neg_examples", action="store_true")
+
+    args.add_argument("--batch_size", type=int, default=32)
+    args.add_argument("--epoch_len", type=int, default=1000)
+    args.add_argument("--num_workers", type=int, default=4)
+    args.add_argument("--num_epochs", type=int, default=10)
+    args.add_argument("--lr", type=float, default=1e-3)
+
+    # Convert to dict
+    args = vars(args.parse_args())
+    main(args)
