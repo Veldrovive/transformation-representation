@@ -9,6 +9,7 @@ import torch
 from tqdm import tqdm
 from pathlib import Path
 from argparse import ArgumentParser
+import numpy as np
 
 device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
@@ -28,7 +29,7 @@ def get_dataloader(args):
         shuffle=True,
         num_workers=args["num_workers"],
         pin_memory=args["device"] != "cpu"
-    )
+    ), d
 
 def get_models(args):
     return ConvTransEmbedder(), Gamma()
@@ -38,6 +39,22 @@ def triplet_loss(anchor, positive, negative, margin=0.2):
     negative_dist = (anchor - negative).pow(2).sum(1)
     losses = F.relu(positive_dist - negative_dist + margin)
     return losses.mean()
+
+def load_checkpoint(checkpoint_dir, embedder, gamma, optimizer, post_fix="latest", device="cpu"):
+    embedder_file = checkpoint_dir / f"embedder_{post_fix}.pt"
+    gamma_file = checkpoint_dir / f"gamma_{post_fix}.pt"
+    optimizer_file = checkpoint_dir / f"optimizer_{post_fix}.pt"
+
+    # Ensure all files exist
+    assert embedder_file.exists()
+    assert gamma_file.exists()
+    assert optimizer_file.exists()
+    print("Found checkpoint files. Loading...")
+
+    # Load the files
+    embedder.load_state_dict(torch.load(embedder_file, map_location=device))
+    gamma.load_state_dict(torch.load(gamma_file, map_location=device))
+    optimizer.load_state_dict(torch.load(optimizer_file))
 
 def main(args):
     device = args["device"]
@@ -53,12 +70,16 @@ def main(args):
     checkpoint_path.mkdir(parents=True, exist_ok=True)
 
     embedder, gamma = get_models(args)
-    dataloader = get_dataloader(args)
+    dataloader, dataset = get_dataloader(args)
 
     embedder = embedder.to(device)
     gamma = gamma.to(device)
 
     optimizer = torch.optim.Adam(list(embedder.parameters()) + list(gamma.parameters()), lr=args["lr"])
+
+    if args["load_checkpoint"]:
+        load_checkpoint(Path(args["checkpoint_dir"]), embedder, gamma, optimizer, device=device, post_fix=args["checkpoint_postfix"])
+
     loss_queue = []
     loss_queue_max_size = 20
 
@@ -73,6 +94,7 @@ def main(args):
         print("Epoch", i)
         wandb.log({"epoch": i})
         epoch_dataloader_iter = iter(dataloader)
+        total_epoch_loss = 0
         progress_bar = tqdm(range(epoch_len))
         for batch_idx in progress_bar:
             batch = next(epoch_dataloader_iter)
@@ -101,8 +123,9 @@ def main(args):
                     loss_queue.pop(0)
                 avg_loss = sum(loss_queue) / len(loss_queue)
                 total_epoch_loss += loss.item()
+                current_epoch_loss = total_epoch_loss / (batch_idx + 1)
                 # print(loss)
-                progress_bar.set_description(f"Loss: {loss.item():.4f} Avg Loss: {avg_loss:.4f}")
+                progress_bar.set_description(f"Loss: {loss.item():.4f} Avg Loss: {avg_loss:.4f} Epoch Loss: {current_epoch_loss:.4f}")
                 wandb.log({"loss": loss.item(), "avg_loss": avg_loss})
             else:
                 logging_warmup -= 1
@@ -112,36 +135,58 @@ def main(args):
             optimizer.step()
         # Save the model checkpoint
         torch.save(embedder.state_dict(), checkpoint_path / "embedder_latest.pt")
+        wandb.save((checkpoint_path / "embedder_latest.pt").absolute().as_posix())
         torch.save(gamma.state_dict(), checkpoint_path / "gamma_latest.pt")
+        wandb.save((checkpoint_path / "gamma_latest.pt").absolute().as_posix())
         # Save the optimizer checkpoint
         torch.save(optimizer.state_dict(), checkpoint_path / "optimizer_latest.pt")
-        # Upload the model checkpoint as an artifact
-        run.log_artifact(checkpoint_path / "embedder_latest.pt")
-        run.log_artifact(checkpoint_path / "gamma_latest.pt")
-        run.log_artifact(checkpoint_path / "optimizer_latest.pt")
+        wandb.save((checkpoint_path / "optimizer_latest.pt").absolute().as_posix())
 
         # Get the average training loss
         avg_epoch_loss = total_epoch_loss / epoch_len
+        wandb.log({"avg_epoch_loss": avg_epoch_loss})
         if avg_epoch_loss < best_epoch_loss:
             best_epoch_loss = avg_epoch_loss
             torch.save(embedder.state_dict(), checkpoint_path / "embedder_best.pt")
+            wandb.save((checkpoint_path / "embedder_best.pt").absolute().as_posix())
             torch.save(gamma.state_dict(), checkpoint_path / "gamma_best.pt")
+            wandb.save((checkpoint_path / "gamma_best.pt").absolute().as_posix())
             torch.save(optimizer.state_dict(), checkpoint_path / "optimizer_best.pt")
-            run.log_artifact(checkpoint_path / "embedder_best.pt")
-            run.log_artifact(checkpoint_path / "gamma_best.pt")
-            run.log_artifact(checkpoint_path / "optimizer_best.pt")
+            wandb.save((checkpoint_path / "optimizer_best.pt").absolute().as_posix())
 
         # TODO: Implement validation
-    # After all the logging is done, don't forget to close your run
+        # We will pass n images through each of the m of the classes of transformations and get their embeddings.
+        # We will then perform a dimension reduction so that we can graph the embeddings on a 2d surface
+        # and compute the accuracy on classification both inside its transformation class and between classes
+        # We could also try performing a downstream task such as regressing the transformation parameters
+
+        # print(f"Beginning validation on epoch {i}")
+        # # We will use the same images with every transformation, but we do select them randomly from the possibilities
+        # validation_dir = Path(args["validation_dir"])
+        # validation_images = validation_dir.glob("**/*.*")
+        # val_inputs = np.random.choice(validation_images, size=args["num_validation_images"])
+        # # We also need to choose the transformation classes we will be using
+        # transformation_classes = dataset.trans_classes
+
+        
+
     run.finish()
 
 if __name__ == "__main__":
     args = ArgumentParser()
     args.add_argument("--anchor_dir", type=str, required=True)
     args.add_argument("--example_dir", type=str, default=None)
+    # args.add_argument("--validation_dir", type=str, required=True)
+    # args.add_argument("--num_validation_images", type=int, default=100)
+    # args.add_argument("--num_validation_classes", type=int, default=10)
+
     args.add_argument("--num_input_examples", type=int, default=3)
-    args.add_argument("--num_classes_per_transformation", type=int, default=20)
+    args.add_argument("--num_classes_per_transformation", type=int, default=100)
     args.add_argument("--sep_neg_examples", action="store_true")
+
+    args.add_argument("--load_checkpoint", action="store_true")
+    args.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    args.add_argument("--checkpoint_postfix", type=str, default="latest")
 
     args.add_argument("--batch_size", type=int, default=32)
     args.add_argument("--epoch_len", type=int, default=1000)

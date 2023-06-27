@@ -32,13 +32,12 @@ class ImageTransformationContrastiveDataset(Dataset):
                  img_size: int = 224,
         ):
         self.anchor_dir = Path(anchor_dir)
-        self.num_anchor_examples = len(list(self.anchor_dir.glob("**/*.*")))
         self.anchor_files = list(self.anchor_dir.glob("**/*.*"))
+        self.num_anchor_examples = len(self.anchor_files)
 
         if example_dir is None:
             print("No example directory specified. Using anchor directory as example directory.")
         self.example_dir = Path(example_dir) if example_dir is not None else Path(anchor_dir)
-        self.num_example_examples = len(list(self.example_dir.glob("**/*.*")))
         self.example_files = list(self.example_dir.glob("**/*.*"))
 
         self.num_input_examples = num_input_examples
