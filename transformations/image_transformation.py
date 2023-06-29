@@ -17,7 +17,7 @@ class GaussianBlurTransformation(Transformation):
         return int(x * (max_value // 2 + 1)) * 2 + 1
 
     @property
-    def id(self):
+    def id():
         return "GaussianBlur"
     
     @property

@@ -8,3 +8,5 @@ __pycache__/
 
 test_image_dataset_output/
 test_image_output/
+
+start.sh

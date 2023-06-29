@@ -30,9 +30,12 @@ class ImageTransformationContrastiveDataset(Dataset):
                  num_input_examples: int = 3,
                  separate_neg_examples: bool = True,
                  img_size: int = 224,
+                 anchor_limit: Optional[int] = None,
         ):
         self.anchor_dir = Path(anchor_dir)
         self.anchor_files = list(self.anchor_dir.glob("**/*.*"))
+        if anchor_limit is not None:
+            self.anchor_files = self.anchor_files[:anchor_limit]
         self.num_anchor_examples = len(self.anchor_files)
 
         if example_dir is None:
@@ -43,6 +46,7 @@ class ImageTransformationContrastiveDataset(Dataset):
         self.num_input_examples = num_input_examples
         self.trans_classes = trans_classes
         self.num_trans_classes = len(trans_classes)
+        
 
         if separate_neg_examples:
             print("Separating negative examples. They will not be the same images as positive examples.")
@@ -73,7 +77,7 @@ class ImageTransformationContrastiveDataset(Dataset):
         np_img = img.numpy() * 255
         return np_img.astype(np.uint8)
     
-    def __getitem__(self, idx, verbose=False):
+    def __getitem__(self, idx, verbose=False, val=False):
         """
         To get the item, we first choose the transformation and anchor image. (trans_class=idx%self.num_trans_classes, image=idx//self.num_trans_classes)
 
@@ -104,12 +108,17 @@ class ImageTransformationContrastiveDataset(Dataset):
 
         # Load the positive examples
         positive_images = [self.load_image(f) for f in positive_examples]
+        anchor_image = self.trans_classes[positive_class](anchor_image)
+        anchor_image = torch.from_numpy(anchor_image.astype(np.float32) / 255).permute(2, 0, 1)
+
+        if val:
+            # Then we don't need any of the contrastive examples. We just want the anchor image
+            return anchor_image, positive_class, self.trans_classes[positive_class].id
 
         # Load the negative examples
         negative_images = [self.load_image(f) for f in negative_examples]
 
         # Apply the transformations
-        anchor_image = self.trans_classes[positive_class](anchor_image)
         positive_images = np.stack([self.trans_classes[positive_class](i) for i in positive_images])
         negative_images = np.stack([self.trans_classes[negative_class](i) for i in negative_images])
 
@@ -119,7 +128,6 @@ class ImageTransformationContrastiveDataset(Dataset):
             print("\t", positive_images.shape)
             print("\t", negative_images.shape)
 
-        anchor_image = torch.from_numpy(anchor_image.astype(np.float32) / 255).permute(2, 0, 1)
         positive_images = torch.from_numpy(positive_images.astype(np.float32) / 255).permute(0, 3, 1, 2)
         negative_images = torch.from_numpy(negative_images.astype(np.float32) / 255).permute(0, 3, 1, 2)
 
