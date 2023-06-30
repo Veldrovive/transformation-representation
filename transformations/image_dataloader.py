@@ -27,11 +27,15 @@ class ImageTransformationContrastiveDataset(Dataset):
                  trans_classes: List[Transformation],
                  anchor_dir: Path,
                  example_dir: Optional[Path] = None,
-                 num_input_examples: int = 3,
+                 num_positive_input_examples: int = 1,
+                 num_negative_input_examples: int = 3,
                  separate_neg_examples: bool = True,
                  img_size: int = 224,
                  anchor_limit: Optional[int] = None,
+                 val: bool = False
         ):
+        if num_positive_input_examples != num_negative_input_examples:
+            assert separate_neg_examples, "If num_positive_input_examples != num_negative_input_examples, then separate_neg_examples must be True."
         self.anchor_dir = Path(anchor_dir)
         self.anchor_files = list(self.anchor_dir.glob("**/*.*"))
         if anchor_limit is not None:
@@ -43,7 +47,8 @@ class ImageTransformationContrastiveDataset(Dataset):
         self.example_dir = Path(example_dir) if example_dir is not None else Path(anchor_dir)
         self.example_files = list(self.example_dir.glob("**/*.*"))
 
-        self.num_input_examples = num_input_examples
+        self.num_positive_input_examples = num_positive_input_examples
+        self.num_negative_input_examples = num_negative_input_examples
         self.trans_classes = trans_classes
         self.num_trans_classes = len(trans_classes)
         
@@ -55,6 +60,7 @@ class ImageTransformationContrastiveDataset(Dataset):
         self.separate_neg_examples = separate_neg_examples
 
         self.img_size = img_size
+        self.val = val
 
     def __len__(self):
         """
@@ -77,7 +83,7 @@ class ImageTransformationContrastiveDataset(Dataset):
         np_img = img.numpy() * 255
         return np_img.astype(np.uint8)
     
-    def __getitem__(self, idx, verbose=False, val=False):
+    def __getitem__(self, idx, verbose=False):
         """
         To get the item, we first choose the transformation and anchor image. (trans_class=idx%self.num_trans_classes, image=idx//self.num_trans_classes)
 
@@ -98,10 +104,10 @@ class ImageTransformationContrastiveDataset(Dataset):
             print("Negative transformation:", self.trans_classes[negative_class])
 
         # Choose the positive examples
-        positive_examples = rng.choice(self.example_files, size=self.num_input_examples, replace=False)
+        positive_examples = rng.choice(self.example_files, size=self.num_positive_input_examples, replace=False)
 
         # Choose the negative examples
-        negative_examples = rng.choice(self.example_files, size=self.num_input_examples, replace=False) if self.separate_neg_examples else positive_examples 
+        negative_examples = rng.choice(self.example_files, size=self.num_negative_input_examples, replace=False) if self.separate_neg_examples else positive_examples 
 
         # Load the anchor image
         anchor_image = self.load_image(self.anchor_files[anchor_index])
@@ -111,9 +117,9 @@ class ImageTransformationContrastiveDataset(Dataset):
         anchor_image = self.trans_classes[positive_class](anchor_image)
         anchor_image = torch.from_numpy(anchor_image.astype(np.float32) / 255).permute(2, 0, 1)
 
-        if val:
+        if self.val:
             # Then we don't need any of the contrastive examples. We just want the anchor image
-            return anchor_image, positive_class, self.trans_classes[positive_class].id
+            return anchor_image, positive_class, self.trans_classes[positive_class].id, anchor_index
 
         # Load the negative examples
         negative_images = [self.load_image(f) for f in negative_examples]
@@ -140,8 +146,11 @@ def create_image_transformation_dataset(
         num_classes_per_transformation: Union[int, List[int]],
         anchor_dir: Path,
         example_dir: Optional[Path] = None,
-        num_input_examples: int = 3,
-        separate_neg_examples: bool = True    
+        num_positive_input_examples: int = 1,
+        num_negative_input_examples: int = 1,
+        separate_neg_examples: bool = True,
+        anchor_limit: Optional[int] = None,
+        val: bool = False
     ):
     """
     Creates a dataset for learning transformation representations using contrastive learning.
@@ -164,6 +173,9 @@ def create_image_transformation_dataset(
         trans_classes=transformation_classes,
         anchor_dir=anchor_dir,
         example_dir=example_dir,
-        num_input_examples=num_input_examples,
-        separate_neg_examples=separate_neg_examples
+        num_positive_input_examples=num_positive_input_examples,
+        num_negative_input_examples=num_negative_input_examples,
+        separate_neg_examples=separate_neg_examples,
+        anchor_limit=anchor_limit,
+        val=val
     )

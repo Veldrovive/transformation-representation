@@ -17,7 +17,7 @@ class GaussianBlurTransformation(Transformation):
         return int(x * (max_value // 2 + 1)) * 2 + 1
 
     @property
-    def id():
+    def id(self):
         return "GaussianBlur"
     
     @property
@@ -370,3 +370,13 @@ transformation_classes = [
     # ElasticTransformation
     FisheyeDistortionTransformation
 ]
+
+transformation_name_map = {
+    "gaussian": GaussianBlurTransformation,
+    "median": MedianBlurTransformation,
+    "noise": AddNoiseTransformation,
+    "erosion": ErosionTransformation,
+    "dilation": DilationTransformation,
+    "perspective": PerspectiveTransformation,
+    "fisheye": FisheyeDistortionTransformation
+}

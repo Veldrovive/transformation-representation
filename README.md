@@ -27,3 +27,16 @@ In order to test this method, we first modify the standard MNIST task by definin
 We then increase the complexity by performing classification of imagenet though transformations.
 
 For a test of effectiveness, we also train a normal network without using any example inputs with a similar number of parameters varying the severity and variation in transformations.
+
+### Personal Notes:
+I think this proof of concept serves better if it is just plain contrastive loss on the transformation without any gamma function. Once we know how effective that is we can then introduce combination rules that allow us to take into account multiple examples. We can explore plain combinations with means or other symmetric functions.
+
+We could also explore more advanced combination rules such as attention.
+
+We can also explore this separately in something like learning embeddings of videos. Or better use a masking method to remove most of the information in the image and then use combination to recover it to validate the method which can then be applied to stuff like video scene representation or more complex things like transformation representation.
+
+For this task it would be interesting to explore where to exchange information between the representations. Like in a convnet would it be useful to have an interem layer before hitting the representation where information can be exchanged?
+
+I guess this task is something like multi-instance representation learning or fusion representation learning?
+
+There's also the idea of grounding the system more in bayesian statistics by treating the representation as a transformation from a uniform to unknown distribution by sampling the space and treating the result as a system we can perform filtering on. Not exactly sure of the training process. Maybe generate a mixture model then have the contrastive objective approximate a KL divergence maximizing that of the positive example and minimizing the negative example. I guess the number of samples in the mixture model would be a hyperparameter. This is most useful if sometimes the mixture model can well approximated by completely disjoint set of distributions as otherwise we could just view this as manually defining part of the latent space manifold. Although in this case we are also trying to get the networks to quantify its uncertainty through the use of predicting the standard deviation of the transformed guassians so maybe even then it couldn't be approximated by a different latent space geometry.

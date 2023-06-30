@@ -49,5 +49,12 @@ class Gamma(nn.Module):
         x = self.fc1(x)
         return torch.mean(x, dim=-2)
 
+class IdentityGamma(nn.Module):
+    """
+    This gamma expects input to be (1, 128) and just returns the first element
+    """
+    def __init__(self):
+        super(IdentityGamma, self).__init__()
 
-
+    def forward(self, x):
+        return x[0]
