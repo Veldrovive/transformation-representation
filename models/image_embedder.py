@@ -48,6 +48,38 @@ class Gamma(nn.Module):
     def forward(self, x):
         x = self.fc1(x)
         return torch.mean(x, dim=-2)
+    
+class AttentionGamma(nn.Module):
+    """
+    Uses a self-attention layer instead of a linear layer to provide the combination rule for the vectors.
+    Still averages the outputs of the attention to ensure a symmetric function.
+    """
+    def __init__(self):
+        super(AttentionGamma, self).__init__()
+        self.fc1 = nn.Linear(128, 128)  # Represents the combination rule for the vectors
+        self.attn = nn.MultiheadAttention(128, 1)
+        self.fc2 = nn.Linear(256, 128)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        residual = x
+        x = x.permute(1, 0, 2)
+        x, _ = self.attn(x, x, x)
+        x = x.permute(1, 0, 2)
+        # Concatenate the original input with the attention output
+        x = torch.cat((x, residual), dim=-1)
+        x = self.fc2(x)
+        return torch.mean(x, dim=-2)
+    
+class AvgGamma(nn.Module):
+    """
+    This gamma expects input to be (n, 128) and just returns the average of the vectors
+    """
+    def __init__(self):
+        super(AvgGamma, self).__init__()
+
+    def forward(self, x):
+        return torch.mean(x, dim=-2)
 
 class IdentityGamma(nn.Module):
     """

@@ -1,7 +1,7 @@
 import wandb
 from transformations import image_transformation
 from transformations.image_dataloader import create_image_transformation_dataset, ImageTransformationContrastiveDataset
-from models.image_embedder import ConvTransEmbedder, Gamma, IdentityGamma
+from models.image_embedder import ConvTransEmbedder, Gamma, AttentionGamma, AvgGamma
 from typing import Dict, List, Tuple
 from PIL import Image
 
@@ -37,6 +37,8 @@ TODO:
 6. Change validation to also into account gamma combination
 """
 
+UPLOAD_CHECKPOINTS = False
+
 def get_dataloader(args, transformation_classes):
     d = create_image_transformation_dataset(
         seed=0,
@@ -44,9 +46,10 @@ def get_dataloader(args, transformation_classes):
         num_classes_per_transformation=args["num_classes_per_transformation"],
         anchor_dir=Path(args["anchor_dir"]),
         example_dir=Path(args["example_dir"]) if args["example_dir"] is not None else None,
-        num_positive_input_examples=args["num_positive_input_examples"],
-        num_negative_input_examples=args["num_negative_input_examples"],
-        separate_neg_examples=args["sep_neg_examples"]
+        num_positive_input_examples=args["max_num_positive_input_examples"],
+        num_negative_input_examples=args["max_num_negative_input_examples"],
+        separate_neg_examples=args["sep_neg_examples"],
+        num_anchors=args["max_num_anchors"],
     )
     return DataLoader(
         d,
@@ -67,11 +70,12 @@ def get_val_dataloader(args, transformation_classes):
         num_negative_input_examples=0,
         separate_neg_examples=False,
         anchor_limit=args["num_validation_images"],
-        val=True
+        val=True,
+        num_anchors=args["val_num_anchors"],
     )
     return DataLoader(
         d,
-        batch_size=64,
+        batch_size=args["val_batch_size"],
         shuffle=False,
         num_workers=args["num_workers"],
         pin_memory=args["device"] != "cpu"
@@ -82,15 +86,24 @@ def get_models(args):
     if args["gamma"] == "none":
         # Then gamma just takes the first embedding as there should only be one
         # Use a pytorch module so that it can be moved to the GPU
+        print("Using no gamma")
         gamma = nn.Identity()
     elif args["gamma"] == "mlp":
+        print("Using MLP gamma")
         gamma = Gamma()
+    elif args["gamma"] == "attention":
+        print("Using attention gamma")
+        gamma = AttentionGamma()
+    elif args["gamma"] == "avg":
+        print("Using average gamma")
+        gamma = AvgGamma()
     else:
         raise Exception(f"Unknown gamma model {args['gamma']}")
     gamma.to(args["device"])
 
     embedder = None
     if args["embedder"] == "conv":
+        print("Using conv embedder")
         embedder = ConvTransEmbedder()
     else:
         raise Exception(f"Unknown embedder model {args['embedder']}")
@@ -122,6 +135,7 @@ def pairwise_distance(anchor, positive, negative, metric='euclidean'):
 
 def tuplet_loss(anchor, positive, negative, margin=0.2, metric='euclidean'):
     # print(f"Anchor shape: {anchor.shape}, positive shape: {positive.shape}, negative shape: {negative.shape}")
+    assert positive.shape[1] == 1, "Positive should only have one example"
     positive = positive[:, 0, :]
     positive_dist, negative_dist = pairwise_distance(anchor, positive, negative, metric)
 
@@ -160,12 +174,17 @@ def evaluate_model(args, epoch, artifact_path, embedder: ConvTransEmbedder, gamm
     all_embeddings, all_classes, all_transformations, all_anchor_idxs = [], [], [], []
     # for anchors, classes, transformations in iterate_val_dataset(val_dataset, batch_size=batch_size):
     for anchors, classes, transformations, anchor_idxs in tqdm(val_dataloader):
+        num_anchors = anchors.shape[1]
+        anchors = anchors.reshape(-1, * anchors.shape[2:])
         embeddings = embedder(anchors.to(device))
+        embeddings = embeddings.reshape(-1, num_anchors, embeddings.shape[1])
+        if args["apply_gamma_anchor"]:
+            embeddings = gamma(embeddings)
         # embeddings = torch.from_numpy(np.random.random(embeddings.shape).astype(np.float32)).to(device)
         all_embeddings.extend(embeddings.detach().cpu().numpy())
         all_classes.extend(classes)
         all_transformations.extend(transformations)
-        all_anchor_idxs.extend(anchor_idxs)
+        all_anchor_idxs.extend([str(idxs) for idxs in anchor_idxs])
     np_all_embeddings = np.stack(all_embeddings)
     np_all_classes = np.array(all_classes)
     np_all_transformations = np.array(all_transformations)
@@ -222,7 +241,8 @@ def graph_reduced_dimensions(mapper, labels, path, show_legend=True):
         plt.gca().get_legend().remove()
 
     plt.savefig(path.absolute().as_posix())
-    plt.clf()    
+    plt.clf()
+    plt.close()
 
 def main(args):
     device = args["device"]
@@ -265,6 +285,10 @@ def main(args):
     print(f"Initial class accuracy: {initial_eval['class_accuracy']}, transformation accuracy: {initial_eval['transformation_accuracy']}, anchor accuracy: {initial_eval['anchor_idx_accuracy']}")
     wandb.log(initial_eval)
 
+    get_num_positive_examples = lambda: args["max_num_positive_input_examples"] if len(args["num_positive_input_examples"]) == 1 else np.random.choice(args["num_positive_input_examples"])
+    get_num_negative_examples = lambda: args["max_num_negative_input_examples"] if len(args["num_negative_input_examples"]) == 1 else np.random.choice(args["num_negative_input_examples"])
+    get_num_anchors = lambda: args["max_num_anchors"] if len(args["num_anchors"]) == 1 else np.random.choice(args["num_anchors"])
+
     for i in range(1, args["num_epochs"]+1):
         print("Epoch", i)
         wandb.log({"epoch": i})
@@ -280,21 +304,43 @@ def main(args):
             pos = batch[1].to(device)
             neg = batch[2].to(device)
 
-            anchor_embedding = embedder(anchor)
+            # # We want to randomly sample the number of positive and negative examples
+            anchor = anchor[:, :get_num_anchors()]
+            pos = pos[:, :get_num_positive_examples()]
+            neg = neg[:, :get_num_negative_examples()]
 
-            original_pos_shape = pos.shape
-            original_neg_shape = neg.shape
+            # original_pos_shape = pos.shape
+            # original_neg_shape = neg.shape
+            original_num_pos = pos.shape[1]
+            original_num_neg = neg.shape[1]
+            original_num_anchors = anchor.shape[1]
+
             pos = pos.reshape(-1, * pos.shape[2:])
             neg = neg.reshape(-1, * neg.shape[2:])
+            anchor = anchor.reshape(-1, * anchor.shape[2:])
+
             pos_embeddings = embedder(pos)
             neg_embeddings = embedder(neg)
-            pos_embeddings = pos_embeddings.reshape(*original_pos_shape[:2], 128)
-            neg_embeddings = neg_embeddings.reshape(*original_neg_shape[:2], 128)
+            anchor_embedding = embedder(anchor)
+
+            pos_embeddings = pos_embeddings.reshape(-1, original_num_pos, 128)
+            neg_embeddings = neg_embeddings.reshape(-1, original_num_neg, 128)
+            anchor_embedding = anchor_embedding.reshape(-1, original_num_anchors, 128)
+
+            # As a speed test, we randomly sample the number of positive and negative examples here instead
+            # anchor_embedding = anchor_embedding[:, :get_num_anchors()]
+            # pos_embeddings = pos_embeddings[:, :get_num_positive_examples()]
+            # neg_embeddings = neg_embeddings[:, :get_num_negative_examples()]
+
+            if args["apply_gamma_anchor"]:
+                anchor_embedding = gamma(anchor_embedding)
             pos_embedding = gamma(pos_embeddings)
             neg_embedding = gamma(neg_embeddings)
 
-            # loss = triplet_loss(anchor_embedding, pos_embedding, neg_embedding)
-            loss = tuplet_loss(anchor_embedding, pos_embedding, neg_embedding)
+            if args["loss"] == "triplet":
+                loss = triplet_loss(anchor_embedding, pos_embedding, neg_embedding)
+            elif args["loss"] == "tuplet":
+                loss = tuplet_loss(anchor_embedding, pos_embedding, neg_embedding)
 
             # Log the loss to wandb
             if logging_warmup == 0:
@@ -313,25 +359,29 @@ def main(args):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        
         # Save the model checkpoint
         torch.save(embedder.state_dict(), checkpoint_path / "embedder_latest.pt")
-        wandb.save((checkpoint_path / "embedder_latest.pt").absolute().as_posix())
         torch.save(gamma.state_dict(), checkpoint_path / "gamma_latest.pt")
-        wandb.save((checkpoint_path / "gamma_latest.pt").absolute().as_posix())
         # Save the optimizer checkpoint
         torch.save(optimizer.state_dict(), checkpoint_path / "optimizer_latest.pt")
-        wandb.save((checkpoint_path / "optimizer_latest.pt").absolute().as_posix())
+        if UPLOAD_CHECKPOINTS:
+            wandb.save((checkpoint_path / "embedder_latest.pt").absolute().as_posix())
+            wandb.save((checkpoint_path / "gamma_latest.pt").absolute().as_posix())
+            wandb.save((checkpoint_path / "optimizer_latest.pt").absolute().as_posix())
+
 
         # Get the average training loss
         avg_epoch_loss = total_epoch_loss / epoch_len
         if avg_epoch_loss < best_epoch_loss:
             best_epoch_loss = avg_epoch_loss
             torch.save(embedder.state_dict(), checkpoint_path / "embedder_best.pt")
-            wandb.save((checkpoint_path / "embedder_best.pt").absolute().as_posix())
             torch.save(gamma.state_dict(), checkpoint_path / "gamma_best.pt")
-            wandb.save((checkpoint_path / "gamma_best.pt").absolute().as_posix())
             torch.save(optimizer.state_dict(), checkpoint_path / "optimizer_best.pt")
-            wandb.save((checkpoint_path / "optimizer_best.pt").absolute().as_posix())
+            if UPLOAD_CHECKPOINTS:
+                wandb.save((checkpoint_path / "embedder_best.pt").absolute().as_posix())
+                wandb.save((checkpoint_path / "gamma_best.pt").absolute().as_posix())
+                wandb.save((checkpoint_path / "optimizer_best.pt").absolute().as_posix())
 
         # TODO: Implement validation
         # We will pass n images through each of the m of the classes of transformations and get their embeddings.
@@ -375,9 +425,12 @@ if __name__ == "__main__":
     args.add_argument("--validation_dir", type=str, required=True)
     args.add_argument("--num_validation_images", type=int, default=100)
     args.add_argument("--num_validation_classes", type=int, default=10)
+    args.add_argument("--val_batch_size", type=int, default=32)
+    args.add_argument("--val_num_anchors", type=int, default=5)
 
-    args.add_argument("--num_positive_input_examples", type=int, default=1)
-    args.add_argument("--num_negative_input_examples", type=int, default=3)
+    args.add_argument("--num_positive_input_examples", nargs="+", type=int, default=[1], action="store")
+    args.add_argument("--num_negative_input_examples", nargs="+", type=int, default=[3], action="store")
+    args.add_argument("--num_anchors", nargs="+", type=int, default=[1], action="store")
     args.add_argument("--num_classes_per_transformation", type=int, default=100)
     args.add_argument("--sep_neg_examples", action="store_true")
 
@@ -395,11 +448,17 @@ if __name__ == "__main__":
     args.add_argument("--seed", type=int, default=None)
     args.add_argument("--gamma", type=str, default="mlp")
     args.add_argument("--embedder", type=str, default="conv")
+    args.add_argument("--loss", type=str, default="triplet")
+    args.add_argument("--apply_gamma_anchor", action="store_true")
 
     # Convert to dict
     args = vars(args.parse_args())
     if args["seed"] is not None:
         set_seed(args["seed"])
+    
+    args["max_num_positive_input_examples"] = max(args["num_positive_input_examples"])
+    args["max_num_negative_input_examples"] = max(args["num_negative_input_examples"])
+    args["max_num_anchors"] = max(args["num_anchors"])
 
     print(args)
     main(args)
