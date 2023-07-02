@@ -14,6 +14,7 @@ from pathlib import Path
 from argparse import ArgumentParser
 import numpy as np
 import random
+import subprocess
 
 import matplotlib.pyplot as plt
 
@@ -143,22 +144,62 @@ def tuplet_loss(anchor, positive, negative, margin=0.2, metric='euclidean'):
 
     return losses.mean()
 
-def load_checkpoint(checkpoint_dir, embedder, gamma, optimizer, post_fix="latest", device="cpu"):
-    embedder_file = checkpoint_dir / f"embedder_{post_fix}.pt"
-    gamma_file = checkpoint_dir / f"gamma_{post_fix}.pt"
-    optimizer_file = checkpoint_dir / f"optimizer_{post_fix}.pt"
+def get_git_hash():
+    try:
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip().decode("utf-8")
+    except:
+        return "Unknown"
 
-    # Ensure all files exist
-    assert embedder_file.exists()
-    assert gamma_file.exists()
-    assert optimizer_file.exists()
-    print("Found checkpoint files. Loading...")
+def save_checkpoint(save_path, embedder, gamma, optimizer, epoch: int, run_id: str, args: Dict):
+    git_hash = get_git_hash()
+    embedder_dict = embedder.state_dict()
+    gamma_dict = gamma.state_dict()
+    optimizer_dict = optimizer.state_dict()
 
-    # Load the files
-    embedder.load_state_dict(torch.load(embedder_file, map_location=device))
-    gamma.load_state_dict(torch.load(gamma_file, map_location=device))
-    optimizer.load_state_dict(torch.load(optimizer_file))
+    run_metadata = {
+        "epoch": epoch,
+        "run_id": run_id,
+        "args": args,
+        "git_hash": git_hash,
+    }
 
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Saving checkpoint to {save_path}")
+    torch.save({
+        "embedder": embedder_dict,
+        "gamma": gamma_dict,
+        "optimizer": optimizer_dict,
+        "metadata": run_metadata,
+    }, save_path)
+
+def load_checkpoint(checkpoint_path, embedder, gamma, optimizer, args: Dict, device="cpu"):
+    checkpoint_path = Path(checkpoint_path)
+    assert checkpoint_path.exists(), f"Checkpoint path {checkpoint_path} does not exist"
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Check the git hash
+    git_hash = get_git_hash()
+    if checkpoint["metadata"]["git_hash"] != git_hash:
+        print(f"\n******************\nWarning: git hash of checkpoint ({checkpoint['metadata']['git_hash']}) does not match current git hash ({git_hash})\n******************\n")
+
+    embedder.load_state_dict(checkpoint["embedder"])
+    gamma.load_state_dict(checkpoint["gamma"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+
+    print("Checking training argument consistency...")
+    any_different = False
+    for key, item in checkpoint["metadata"]["args"].items():
+        try:
+            if args[key] != item:
+                print(f"\t- Warning: checkpoint arg {key} ({item}) does not match current arg ({args[key]})")
+                any_different = True
+        except KeyError:
+            print(f"\t- Warning: checkpoint arg {key} ({item}) not found in current args")
+            any_different = True
+    if not any_different:
+        print("\tAll checkpoint args match current args")
+            
+    return checkpoint["metadata"]
 
 def evaluate_model(args, epoch, artifact_path, embedder: ConvTransEmbedder, gamma: Gamma, val_dataloader: DataLoader):
     device = args["device"]
@@ -268,8 +309,10 @@ def main(args):
 
     optimizer = torch.optim.Adam(list(embedder.parameters()) + list(gamma.parameters()), lr=args["lr"])
 
+    start_epoch = 0
     if args["load_checkpoint"]:
-        load_checkpoint(Path(args["checkpoint_dir"]), embedder, gamma, optimizer, device=device, post_fix=args["checkpoint_postfix"])
+        metadata = load_checkpoint(Path(args["checkpoint"]), embedder, gamma, optimizer, device=device, args=args)
+        start_epoch = metadata["epoch"]
 
     loss_queue = []
     loss_queue_max_size = 20
@@ -289,7 +332,7 @@ def main(args):
     get_num_negative_examples = lambda: args["max_num_negative_input_examples"] if len(args["num_negative_input_examples"]) == 1 else np.random.choice(args["num_negative_input_examples"])
     get_num_anchors = lambda: args["max_num_anchors"] if len(args["num_anchors"]) == 1 else np.random.choice(args["num_anchors"])
 
-    for i in range(1, args["num_epochs"]+1):
+    for i in range(start_epoch+1, args["num_epochs"]+1):
         print("Epoch", i)
         wandb.log({"epoch": i})
         epoch_dataloader_iter = iter(dataloader)
@@ -361,33 +404,21 @@ def main(args):
             optimizer.step()
         
         # Save the model checkpoint
-        torch.save(embedder.state_dict(), checkpoint_path / "embedder_latest.pt")
-        torch.save(gamma.state_dict(), checkpoint_path / "gamma_latest.pt")
-        # Save the optimizer checkpoint
-        torch.save(optimizer.state_dict(), checkpoint_path / "optimizer_latest.pt")
+        save_checkpoint(
+            checkpoint_path / "latest.pt",
+            embedder,
+            gamma,
+            optimizer,
+            i,
+            run_id,
+            args,
+        )
         if UPLOAD_CHECKPOINTS:
-            wandb.save((checkpoint_path / "embedder_latest.pt").absolute().as_posix())
-            wandb.save((checkpoint_path / "gamma_latest.pt").absolute().as_posix())
-            wandb.save((checkpoint_path / "optimizer_latest.pt").absolute().as_posix())
+            wandb.save((checkpoint_path / "latest.pt").absolute().as_posix())
 
-
-        # Get the average training loss
+        # Get the average training loss for the epoch
         avg_epoch_loss = total_epoch_loss / epoch_len
-        if avg_epoch_loss < best_epoch_loss:
-            best_epoch_loss = avg_epoch_loss
-            torch.save(embedder.state_dict(), checkpoint_path / "embedder_best.pt")
-            torch.save(gamma.state_dict(), checkpoint_path / "gamma_best.pt")
-            torch.save(optimizer.state_dict(), checkpoint_path / "optimizer_best.pt")
-            if UPLOAD_CHECKPOINTS:
-                wandb.save((checkpoint_path / "embedder_best.pt").absolute().as_posix())
-                wandb.save((checkpoint_path / "gamma_best.pt").absolute().as_posix())
-                wandb.save((checkpoint_path / "optimizer_best.pt").absolute().as_posix())
 
-        # TODO: Implement validation
-        # We will pass n images through each of the m of the classes of transformations and get their embeddings.
-        # We will then perform a dimension reduction so that we can graph the embeddings on a 2d surface
-        # and compute the accuracy on classification both inside its transformation class and between classes
-        # We could also try performing a downstream task such as regressing the transformation parameters
         evaluation, trans_cluster_image_path, class_cluster_image_path, anchor_cluster_image_path = evaluate_model(args, epoch=i, artifact_path=artifact_path, embedder=embedder, gamma=gamma, val_dataloader=val_dataloader)
         evaluation["avg_epoch_loss"] = avg_epoch_loss
         print(evaluation)
@@ -403,6 +434,21 @@ def main(args):
         anchor_cluster_image = np.array(anchor_cluster_image)
         
         wandb.log({"trans_cluster_image": wandb.Image(trains_cluster_image), "class_cluster_image": wandb.Image(class_cluster_image), "anchor_cluster_image": wandb.Image(anchor_cluster_image)})
+
+        # TODO: Use one of the evaluation metrics to determine the best model
+        # We are not doing this currently as the metrics are unreliable
+        if avg_epoch_loss < best_epoch_loss:
+            save_checkpoint(
+                checkpoint_path / "best.pt",
+                embedder,
+                gamma,
+                optimizer,
+                i,
+                run_id,
+                args,
+            )
+            if UPLOAD_CHECKPOINTS:
+                wandb.save((checkpoint_path / "best.pt").absolute().as_posix())
 
     run.finish()
 
@@ -435,7 +481,7 @@ if __name__ == "__main__":
     args.add_argument("--sep_neg_examples", action="store_true")
 
     args.add_argument("--load_checkpoint", action="store_true")
-    args.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    args.add_argument("--checkpoint", type=str, default="checkpoints")
     args.add_argument("--checkpoint_postfix", type=str, default="latest")
 
     args.add_argument("--batch_size", type=int, default=32)
