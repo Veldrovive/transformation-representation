@@ -65,7 +65,7 @@ class Parameterization:
     A simple class that provides a consistent way to generate the parameters of a transformation.
     Produces a dictionary of parameter values for a given transformation given a list of parameter ids.
     """
-    def __init__(self, parameter_ids: List[str], param_generators: List[RandomGenerator], seed: Optional[int] = None, override: Optional[float] = None):
+    def __init__(self, parameter_ids: List[str], param_generators: List[RandomGenerator], seed: Optional[int] = None, override: Optional[int] = None):
         self.size = len(parameter_ids)
         self.parameter_ids = parameter_ids
         self.param_generators = param_generators
@@ -78,6 +78,7 @@ class Parameterization:
         :param override: Sets all values of the parameterization to the given value
         :return: The parameterization
         """
+        seed_generator = np.random.default_rng(seed)
         if override is not None:
             # parameterization_values = np.full(self.size, override)
             assert type(override) == int and override >= 0 and override < 3
@@ -85,7 +86,8 @@ class Parameterization:
             self.parameterization = dict(zip(self.parameter_ids, parameterization_values))
             return
         for generator in self.param_generators:
-            generator.seed(seed)
+            gen_seed = seed_generator.integers(0, 2**32 - 1)
+            generator.seed(gen_seed)
         parameterization_values = [generator() for generator in self.param_generators]
         self.parameterization = dict(zip(self.parameter_ids, parameterization_values))
 
@@ -135,7 +137,8 @@ class ApplicationGenerator(RandomGenerator):
     """
     def __init__(self, func, seed: Optional[int] = None):
         """
-        Initialize a new instance of the random generator class
+        Applies a function passed in to a random parameter [0, 1)
+        Used when there is no appropriate default generator
         :param func: The function to apply to the random parameter
         :param seed: The seed to use for the random number generator
         """
@@ -250,6 +253,25 @@ class ChoiceGenerator(RandomGenerator):
         """
         return [self.choices[0], self.choices[len(self.choices) // 2], self.choices[-1]]
 
+class BooleanGenerator(RandomGenerator):
+    """
+    Returns a random boolean value
+    """
+    def generate(self) -> Any:
+        """
+        Generates a random parameter
+        :return: The generated parameter
+        """
+        return np.random.choice([True, False])
+    
+    @property
+    def extremes(self) -> List[Any]:
+        """
+        Returns the minimum value, the maximum value, and an average example value
+        :return: The minimum value, the maximum value, and an average example value
+        """
+        return [False, False, True]
+
 class GaussianGenerator(RandomGenerator):
     """
     Returns a number from a Gaussian distribution
@@ -314,11 +336,9 @@ class Transformation(ABC):
     """
     An abstract class that defines the interface for all transformations
     """
-    def __init__(self, seed: Optional[int] = None, override: Optional[float] = None):
+    def __init__(self, seed: Optional[int] = None, override: Optional[int] = None):
         """
         Initialize a new instance of the transformation class
-        :param identifier: Unique identifier string for the transformation
-        :param param_size: Parameterization size for the transformation
         :param seed: The seed to use for the random number generator
         :param override: Sets all values of the parameterization to the given value
         """
@@ -326,6 +346,7 @@ class Transformation(ABC):
         # If an entry is of type str, we assume the Generator is the DefaultGenerator
         param_str_ids = []
         param_generators = []
+        self.seed = seed
         for param_id in self.param_ids:
             if isinstance(param_id, str):
                 param_str_ids.append(param_id)

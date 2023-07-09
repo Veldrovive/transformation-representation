@@ -6,6 +6,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as transforms
 import torch
+import random
 
 class ImageTransformationContrastiveDataset(Dataset):
     """
@@ -39,6 +40,11 @@ class ImageTransformationContrastiveDataset(Dataset):
             assert separate_neg_examples, "If num_positive_input_examples != num_negative_input_examples, then separate_neg_examples must be True."
         self.anchor_dir = Path(anchor_dir)
         self.anchor_files = list(self.anchor_dir.glob("**/*.*"))
+        # Shuffle the anchor files
+        random.shuffle(self.anchor_files)
+        self.img_classes = [entry.name for entry in self.anchor_dir.iterdir() if entry.is_dir()]
+        self.img_class_ids = {img_class: i for i, img_class in enumerate(self.img_classes)}
+        self.file_idx_to_img_class = {i: self.img_class_ids[f.parent.name] for i, f in enumerate(self.anchor_files)}
         if anchor_limit is not None:
             self.anchor_files = self.anchor_files[:anchor_limit]
         self.num_anchor_examples = len(self.anchor_files)
@@ -120,15 +126,19 @@ class ImageTransformationContrastiveDataset(Dataset):
 
         # Load the anchor image
         anchor_images = [self.load_image(self.anchor_files[i]) for i in anchor_indices]
-
-        # Load the positive examples
-        positive_images = [self.load_image(f) for f in positive_examples]
         anchor_images = np.stack([self.trans_classes[positive_class](i) for i in anchor_images])
         anchor_images = torch.from_numpy(anchor_images.astype(np.float32) / 255).permute(0, 3, 1, 2)
 
+        # Anchor image classes
+        anchor_image_classes = [self.file_idx_to_img_class[i] for i in anchor_indices]
+        anchor_image_classes = torch.tensor(anchor_image_classes)
+
         if self.val:
             # Then we don't need any of the contrastive examples. We just want the anchor image
-            return anchor_images, positive_class, self.trans_classes[positive_class].id, anchor_indices
+            return anchor_images, positive_class, self.trans_classes[positive_class].id, anchor_indices, anchor_image_classes
+
+        # Load the positive examples
+        positive_images = [self.load_image(f) for f in positive_examples]
 
         # Load the negative examples
         negative_images = [self.load_image(f) for f in negative_examples]

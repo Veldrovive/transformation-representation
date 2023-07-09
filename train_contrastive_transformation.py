@@ -2,7 +2,7 @@ import wandb
 from transformations import image_transformation
 from transformations.image_dataloader import create_image_transformation_dataset, ImageTransformationContrastiveDataset
 from models.image_embedder import ConvTransEmbedder, Gamma, AttentionGamma, AvgGamma
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from PIL import Image
 
 from torch.utils.data import DataLoader
@@ -150,7 +150,7 @@ def get_git_hash():
     except:
         return "Unknown"
 
-def save_checkpoint(save_path, embedder, gamma, optimizer, epoch: int, run_id: str, args: Dict):
+def save_checkpoint(save_path, embedder, gamma, optimizer, epoch: int, step: int, run_id: str, args: Dict):
     git_hash = get_git_hash()
     embedder_dict = embedder.state_dict()
     gamma_dict = gamma.state_dict()
@@ -159,6 +159,7 @@ def save_checkpoint(save_path, embedder, gamma, optimizer, epoch: int, run_id: s
     run_metadata = {
         "epoch": epoch,
         "run_id": run_id,
+        "step": step,
         "args": args,
         "git_hash": git_hash,
     }
@@ -173,7 +174,7 @@ def save_checkpoint(save_path, embedder, gamma, optimizer, epoch: int, run_id: s
         "metadata": run_metadata,
     }, save_path)
 
-def load_checkpoint(checkpoint_path, embedder, gamma, optimizer, args: Dict, device="cpu"):
+def load_checkpoint(args: Dict, checkpoint_path, embedder, gamma, optimizer: Optional[nn.Module] = None, device="cpu", load_optimizer=True):
     checkpoint_path = Path(checkpoint_path)
     assert checkpoint_path.exists(), f"Checkpoint path {checkpoint_path} does not exist"
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -184,7 +185,8 @@ def load_checkpoint(checkpoint_path, embedder, gamma, optimizer, args: Dict, dev
 
     embedder.load_state_dict(checkpoint["embedder"])
     gamma.load_state_dict(checkpoint["gamma"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    if load_optimizer:
+        optimizer.load_state_dict(checkpoint["optimizer"])
 
     print("Checking training argument consistency...")
     any_different = False
@@ -201,77 +203,93 @@ def load_checkpoint(checkpoint_path, embedder, gamma, optimizer, args: Dict, dev
             
     return checkpoint["metadata"]
 
+def create_model_and_load_checkpoint(checkpoint_path, device="cpu", load_optimizer=True):
+    """
+    Gets the args from the checkpoint and then creates the models
+    """
+    assert checkpoint_path.exists(), f"Checkpoint path {checkpoint_path} does not exist"
+    t = torch.load(checkpoint_path, map_location="cpu")
+    args = t["metadata"]["args"]
+    del t
+
+    embedder, gamma = get_models(args)
+    optimizer = None
+    metadata = load_checkpoint(args, checkpoint_path, embedder, gamma, optimizer, device, load_optimizer)
+    return embedder, gamma, optimizer, metadata
+
+
 def evaluate_model(args, epoch, artifact_path, embedder: ConvTransEmbedder, gamma: Gamma, val_dataloader: DataLoader):
-    device = args["device"]
-    embedder.eval()
-    gamma.eval()
+    with torch.no_grad():
+        device = args["device"]
+        embedder.eval()
+        gamma.eval()
 
-    # Each sample from val dataset
-    # has the format (anchor: np.ndarray[C, H, W], class_idx: int, transformation_id: str, anchor_index: int)
-    # We can also recover the transformation from class_idx with val_dataset.trans_classes[class_idx]
+        # Each sample from val dataset
+        # has the format (anchor: np.ndarray[C, H, W], class_idx: int, transformation_id: str, anchor_index: int)
+        # We can also recover the transformation from class_idx with val_dataset.trans_classes[class_idx]
 
-    num_classes = len(val_dataloader.dataset.trans_classes)
-    print(f"Getting {len(val_dataloader.dataset)} evaluation embeddings from {num_classes} classes...")
-    all_embeddings, all_classes, all_transformations, all_anchor_idxs = [], [], [], []
-    # for anchors, classes, transformations in iterate_val_dataset(val_dataset, batch_size=batch_size):
-    for anchors, classes, transformations, anchor_idxs in tqdm(val_dataloader):
-        num_anchors = anchors.shape[1]
-        anchors = anchors.reshape(-1, * anchors.shape[2:])
-        embeddings = embedder(anchors.to(device))
-        embeddings = embeddings.reshape(-1, num_anchors, embeddings.shape[1])
-        if args["apply_gamma_anchor"]:
-            embeddings = gamma(embeddings)
-        # embeddings = torch.from_numpy(np.random.random(embeddings.shape).astype(np.float32)).to(device)
-        all_embeddings.extend(embeddings.detach().cpu().numpy())
-        all_classes.extend(classes)
-        all_transformations.extend(transformations)
-        all_anchor_idxs.extend([str(idxs) for idxs in anchor_idxs])
-    np_all_embeddings = np.stack(all_embeddings)
-    np_all_classes = np.array(all_classes)
-    np_all_transformations = np.array(all_transformations)
-    np_all_anchor_idxs = np.array(all_anchor_idxs)
+        num_classes = len(val_dataloader.dataset.trans_classes)
+        print(f"Getting {len(val_dataloader.dataset)} evaluation embeddings from {num_classes} classes...")
+        all_embeddings, all_classes, all_transformations, all_anchor_idxs = [], [], [], []
+        # for anchors, classes, transformations in iterate_val_dataset(val_dataset, batch_size=batch_size):
+        for anchors, classes, transformations, anchor_idxs, image_classes in tqdm(val_dataloader):
+            num_anchors = anchors.shape[1]
+            anchors = anchors.reshape(-1, * anchors.shape[2:])
+            embeddings = embedder(anchors.to(device))
+            embeddings = embeddings.reshape(-1, num_anchors, embeddings.shape[1])
+            if args["apply_gamma_anchor"]:
+                embeddings = gamma(embeddings)
+            # embeddings = torch.from_numpy(np.random.random(embeddings.shape).astype(np.float32)).to(device)
+            all_embeddings.extend(embeddings.detach().cpu().numpy())
+            all_classes.extend(classes)
+            all_transformations.extend(transformations)
+            all_anchor_idxs.extend([str(idxs) for idxs in anchor_idxs])
+        np_all_embeddings = np.stack(all_embeddings)
+        np_all_classes = np.array(all_classes)
+        np_all_transformations = np.array(all_transformations)
+        np_all_anchor_idxs = np.array(all_anchor_idxs)
 
-    # Fit the two knn classifiers for class, transformation, and anchor index
-    # We expect both class and transformation to grow in accuracy as the model learns to differentiate transformations,
-    # but the anchor index should decrease since we have to pressure the model to learn to differentiate between images
-    print("Fitting knn classifiers...")
-    class_knn = KNeighborsClassifier(n_neighbors=5)
-    class_knn.fit(np_all_embeddings, np_all_classes)
+        # Fit the two knn classifiers for class, transformation, and anchor index
+        # We expect both class and transformation to grow in accuracy as the model learns to differentiate transformations,
+        # but the anchor index should decrease since we have to pressure the model to learn to differentiate between images
+        print("Fitting knn classifiers...")
+        class_knn = KNeighborsClassifier(n_neighbors=5)
+        class_knn.fit(np_all_embeddings, np_all_classes)
 
-    transformation_knn = KNeighborsClassifier(n_neighbors=5)
-    transformation_knn.fit(np_all_embeddings, np_all_transformations)
+        transformation_knn = KNeighborsClassifier(n_neighbors=5)
+        transformation_knn.fit(np_all_embeddings, np_all_transformations)
 
-    anchor_knn = KNeighborsClassifier(n_neighbors=5)
-    anchor_knn.fit(np_all_embeddings, np_all_anchor_idxs)
+        anchor_knn = KNeighborsClassifier(n_neighbors=5)
+        anchor_knn.fit(np_all_embeddings, np_all_anchor_idxs)
 
-    print("Predicting classes and transformations...")
-    all_class_predictions = class_knn.predict(np_all_embeddings)
-    all_transformation_predictions = transformation_knn.predict(np_all_embeddings)
-    all_anchor_idx_predictions = anchor_knn.predict(np_all_embeddings)
+        print("Predicting classes and transformations...")
+        all_class_predictions = class_knn.predict(np_all_embeddings)
+        all_transformation_predictions = transformation_knn.predict(np_all_embeddings)
+        all_anchor_idx_predictions = anchor_knn.predict(np_all_embeddings)
 
-    num_correct_class = (np_all_classes == all_class_predictions).sum()
-    num_correct_transformation = (np_all_transformations == all_transformation_predictions).sum()
-    num_correct_anchor_idx = (np_all_anchor_idxs == all_anchor_idx_predictions).sum()
+        num_correct_class = (np_all_classes == all_class_predictions).sum()
+        num_correct_transformation = (np_all_transformations == all_transformation_predictions).sum()
+        num_correct_anchor_idx = (np_all_anchor_idxs == all_anchor_idx_predictions).sum()
 
-    class_accuracy = num_correct_class / len(np_all_classes)
-    transformation_accuracy = num_correct_transformation / len(np_all_transformations)
-    anchor_idx_accuracy = num_correct_anchor_idx / len(np_all_anchor_idxs)
+        class_accuracy = num_correct_class / len(np_all_classes)
+        transformation_accuracy = num_correct_transformation / len(np_all_transformations)
+        anchor_idx_accuracy = num_correct_anchor_idx / len(np_all_anchor_idxs)
 
-    class_visualization_path = artifact_path / f"reduced_dim_classes_{epoch}.png"
-    transformation_visualization_path = artifact_path / f"reduced_dim_transformations_{epoch}.png"
-    anchor_visualization_path = artifact_path / f"reduced_dim_anchor_idxs_{epoch}.png"
+        class_visualization_path = artifact_path / f"reduced_dim_classes_{epoch}.png"
+        transformation_visualization_path = artifact_path / f"reduced_dim_transformations_{epoch}.png"
+        anchor_visualization_path = artifact_path / f"reduced_dim_anchor_idxs_{epoch}.png"
 
-    print("Graphing reduced dimension representations...")
-    mapper = umap.UMAP().fit(np_all_embeddings)
-    graph_reduced_dimensions(mapper, labels=np_all_classes, path=class_visualization_path, show_legend=False)
-    graph_reduced_dimensions(mapper, labels=np_all_transformations, path=transformation_visualization_path, show_legend=True)
-    graph_reduced_dimensions(mapper, labels=np_all_anchor_idxs, path=anchor_visualization_path, show_legend=False)
+        print("Graphing reduced dimension representations...")
+        mapper = umap.UMAP().fit(np_all_embeddings)
+        graph_reduced_dimensions(mapper, labels=np_all_classes, path=class_visualization_path, show_legend=False)
+        graph_reduced_dimensions(mapper, labels=np_all_transformations, path=transformation_visualization_path, show_legend=True)
+        graph_reduced_dimensions(mapper, labels=np_all_anchor_idxs, path=anchor_visualization_path, show_legend=False)
 
-    return {
-        "class_accuracy": class_accuracy,
-        "transformation_accuracy": transformation_accuracy,
-        "anchor_idx_accuracy": anchor_idx_accuracy,
-    }, transformation_visualization_path, class_visualization_path, anchor_visualization_path
+        return {
+            "class_accuracy": class_accuracy,
+            "transformation_accuracy": transformation_accuracy,
+            "anchor_idx_accuracy": anchor_idx_accuracy,
+        }, transformation_visualization_path, class_visualization_path, anchor_visualization_path
 
 def graph_reduced_dimensions(mapper, labels, path, show_legend=True):
     plt.clf()
@@ -287,18 +305,41 @@ def graph_reduced_dimensions(mapper, labels, path, show_legend=True):
 
 def main(args):
     device = args["device"]
-    # Start a new run
-    run = wandb.init(project='transformation-representation')
+    embedder, gamma = get_models(args)
+    optimizer = torch.optim.Adam(list(embedder.parameters()) + list(gamma.parameters()), lr=args["lr"])
+
+    start_epoch = 0
+    step = 0
+    metadata = None
+    if args["load_checkpoint"]:
+        metadata = load_checkpoint(args, Path(args["checkpoint"]), embedder, gamma, optimizer, device=device)
+        start_epoch = metadata["epoch"]
+        if "step" in metadata:
+            # Update the current step to be the step from the checkpoint
+            print(f"Setting wandb step to {metadata['step']}")
+            step = metadata["step"]
+        else:
+            print("No wandb step found in checkpoint, setting to 0")
+            step = 0
+    
+    if args["resume_wandb_from_checkpoint"]:
+        assert metadata is not None, "Must load checkpoint to resume wandb"
+        assert "run_id" in metadata and metadata["run_id"] is not None, "Must have run id in checkpoint metadata to resume wandb"
+        # Resume wandb run
+        print(f"Resuming wandb run {metadata['run_id']}")
+        run = wandb.init(project='transformation-representation', id=metadata["run_id"], resume="must")
+    else:
+        # Start a new run
+        run = wandb.init(project='transformation-representation')
+        print(f"Starting new wandb run {run.id}")
     # Add the args to the run
-    wandb.config.update(args)
+    wandb.config.update(args, allow_val_change=True)
     # Get run id
     run_id = wandb.run.id
     artifact_path = Path(args["artifacts_dir"]) / run_id
     artifact_path.mkdir(parents=True, exist_ok=True)
     checkpoint_path = artifact_path / "checkpoints"
     checkpoint_path.mkdir(parents=True, exist_ok=True)
-
-    embedder, gamma = get_models(args)
 
     transformation_classes = [image_transformation.transformation_name_map[trans_name] for trans_name in args["transformation_types"]]
     print("Using transformations: ")
@@ -307,12 +348,6 @@ def main(args):
     dataloader, dataset = get_dataloader(args, transformation_classes)
     val_dataloader, val_dataset = get_val_dataloader(args, transformation_classes)
 
-    optimizer = torch.optim.Adam(list(embedder.parameters()) + list(gamma.parameters()), lr=args["lr"])
-
-    start_epoch = 0
-    if args["load_checkpoint"]:
-        metadata = load_checkpoint(Path(args["checkpoint"]), embedder, gamma, optimizer, device=device, args=args)
-        start_epoch = metadata["epoch"]
 
     loss_queue = []
     loss_queue_max_size = 20
@@ -324,9 +359,9 @@ def main(args):
     epoch_len = min(max_epoch_len, args["epoch_len"])
     logging_warmup = 10
 
-    initial_eval, _, _, _ = evaluate_model(args, 0, artifact_path, embedder, gamma, val_dataloader)
+    initial_eval, _, _, _ = evaluate_model(args, start_epoch, artifact_path, embedder, gamma, val_dataloader)
     print(f"Initial class accuracy: {initial_eval['class_accuracy']}, transformation accuracy: {initial_eval['transformation_accuracy']}, anchor accuracy: {initial_eval['anchor_idx_accuracy']}")
-    wandb.log(initial_eval)
+    wandb.log(initial_eval, step=step)
 
     get_num_positive_examples = lambda: args["max_num_positive_input_examples"] if len(args["num_positive_input_examples"]) == 1 else np.random.choice(args["num_positive_input_examples"])
     get_num_negative_examples = lambda: args["max_num_negative_input_examples"] if len(args["num_negative_input_examples"]) == 1 else np.random.choice(args["num_negative_input_examples"])
@@ -334,7 +369,7 @@ def main(args):
 
     for i in range(start_epoch+1, args["num_epochs"]+1):
         print("Epoch", i)
-        wandb.log({"epoch": i})
+        wandb.log({"epoch": i}, step=step)
         epoch_dataloader_iter = iter(dataloader)
         total_epoch_loss = 0
         progress_bar = tqdm(range(epoch_len))
@@ -395,13 +430,14 @@ def main(args):
                 current_epoch_loss = total_epoch_loss / (batch_idx + 1)
                 # print(loss)
                 progress_bar.set_description(f"Loss: {loss.item():.4f} Avg Loss: {avg_loss:.4f} Epoch Loss: {current_epoch_loss:.4f}")
-                wandb.log({"loss": loss.item(), "avg_loss": avg_loss, "epoch": i})
+                wandb.log({"loss": loss.item(), "avg_loss": avg_loss, "epoch": i}, step=step)
             else:
                 logging_warmup -= 1
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            step += 1
         
         # Save the model checkpoint
         save_checkpoint(
@@ -410,6 +446,7 @@ def main(args):
             gamma,
             optimizer,
             i,
+            step,
             run_id,
             args,
         )
@@ -422,18 +459,22 @@ def main(args):
         evaluation, trans_cluster_image_path, class_cluster_image_path, anchor_cluster_image_path = evaluate_model(args, epoch=i, artifact_path=artifact_path, embedder=embedder, gamma=gamma, val_dataloader=val_dataloader)
         evaluation["avg_epoch_loss"] = avg_epoch_loss
         print(evaluation)
-        wandb.log(evaluation)
+        wandb.log(evaluation, step=step)
         # Log the cluster images
-        trans_cluster_image = Image.open(trans_cluster_image_path)
-        trains_cluster_image = np.array(trans_cluster_image)
+        try:
+            trans_cluster_image = Image.open(trans_cluster_image_path)
+            trains_cluster_image = np.array(trans_cluster_image)
 
-        class_cluster_image = Image.open(class_cluster_image_path)
-        class_cluster_image = np.array(class_cluster_image)
+            class_cluster_image = Image.open(class_cluster_image_path)
+            class_cluster_image = np.array(class_cluster_image)
 
-        anchor_cluster_image = Image.open(anchor_cluster_image_path)
-        anchor_cluster_image = np.array(anchor_cluster_image)
+            anchor_cluster_image = Image.open(anchor_cluster_image_path)
+            anchor_cluster_image = np.array(anchor_cluster_image)
+
+            wandb.log({"trans_cluster_image": wandb.Image(trains_cluster_image), "class_cluster_image": wandb.Image(class_cluster_image), "anchor_cluster_image": wandb.Image(anchor_cluster_image)}, step=step)
+        except:
+            print("Could not load cluster images")
         
-        wandb.log({"trans_cluster_image": wandb.Image(trains_cluster_image), "class_cluster_image": wandb.Image(class_cluster_image), "anchor_cluster_image": wandb.Image(anchor_cluster_image)})
 
         # TODO: Use one of the evaluation metrics to determine the best model
         # We are not doing this currently as the metrics are unreliable
@@ -444,6 +485,7 @@ def main(args):
                 gamma,
                 optimizer,
                 i,
+                step,
                 run_id,
                 args,
             )
@@ -462,7 +504,7 @@ def set_seed(seed):
 
 if __name__ == "__main__":
     args = ArgumentParser()
-    args.add_argument("--transformation_types", type=str, nargs="+", default=["gaussian", "median", "noise", "erosion", "dilation", "perspective", "fisheye"])
+    args.add_argument("--transformation_types", type=str, nargs="+", default=["gaussian", "median", "noise", "erosion", "dilation", "perspective"])
 
     args.add_argument("--anchor_dir", type=str, required=True)
     args.add_argument("--example_dir", type=str, default=None)
@@ -481,8 +523,8 @@ if __name__ == "__main__":
     args.add_argument("--sep_neg_examples", action="store_true")
 
     args.add_argument("--load_checkpoint", action="store_true")
-    args.add_argument("--checkpoint", type=str, default="checkpoints")
-    args.add_argument("--checkpoint_postfix", type=str, default="latest")
+    args.add_argument("--checkpoint", type=str, default=None)
+    args.add_argument("--resume_wandb_from_checkpoint", action="store_true")
 
     args.add_argument("--batch_size", type=int, default=32)
     args.add_argument("--epoch_len", type=int, default=1000)
